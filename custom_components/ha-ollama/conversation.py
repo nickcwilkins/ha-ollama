@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable
 import json
 import logging
+import re
+from collections.abc import AsyncGenerator, Callable
 from typing import Any, Literal
 
 import ollama
-from voluptuous_openapi import convert
-
 from homeassistant.components import assist_pipeline, conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_LLM_HASS_API, MATCH_ALL
@@ -17,6 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import intent, llm
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from voluptuous_openapi import convert
 
 from .const import (
     CONF_KEEP_ALIVE,
@@ -61,7 +61,8 @@ def _format_tool(
 
 
 def _fix_invalid_arguments(value: Any) -> Any:
-    """Attempt to repair incorrectly formatted json function arguments.
+    """
+    Attempt to repair incorrectly formatted json function arguments.
 
     Small models (for example llama3.1 8B) may produce invalid argument values
     which we attempt to repair here.
@@ -79,13 +80,26 @@ def _fix_invalid_arguments(value: Any) -> Any:
 
 
 def _parse_tool_args(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite ollama tool arguments.
+    """
+    Rewrite ollama tool arguments.
 
     This function improves tool use quality by fixing common mistakes made by
     small local tool use models. This will repair invalid json arguments and
     omit unnecessary arguments with empty values that will fail intent parsing.
     """
     return {k: _fix_invalid_arguments(v) for k, v in arguments.items() if v}
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> from the start of the text if present, and strip leading newlines if removed."""
+    if text.startswith("<think>"):
+        # Remove everything from <think> up to and including the first </think>
+        new_text = re.sub(r"^<think>[\s\S]*?</think>", "", text, count=1)
+        # If think tags were removed, strip all leading newlines
+        if new_text != text:
+            return new_text.lstrip("\n")
+        return new_text
+    return text
 
 
 def _convert_content(
@@ -100,9 +114,15 @@ def _convert_content(
             content=json.dumps(chat_content.tool_result),
         )
     if isinstance(chat_content, conversation.AssistantContent):
+        # Remove <think> tags for non-streamed output
+        content = (
+            _strip_think_tags(chat_content.content)
+            if chat_content.content
+            else chat_content.content
+        )
         return ollama.Message(
             role=MessageRole.ASSISTANT.value,
-            content=chat_content.content,
+            content=content,
             tool_calls=[
                 ollama.Message.ToolCall(
                     function=ollama.Message.ToolCall.Function(
@@ -129,7 +149,8 @@ def _convert_content(
 async def _transform_stream(
     result: AsyncGenerator[ollama.Message],
 ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
-    """Transform the response stream into HA format.
+    """
+    Transform the response stream into HA format.
 
     An Ollama streaming response may come in chunks like this:
 
@@ -142,28 +163,60 @@ async def _transform_stream(
     This generator conforms to the chatlog delta stream expectations in that it
     yields deltas, then the role only once the response is done.
     """
-
     new_msg = True
-    async for response in result:
-        _LOGGER.debug("Received response: %s", response)
-        response_message = response["message"]
-        chunk: conversation.AssistantContentDeltaDict = {}
-        if new_msg:
-            new_msg = False
-            chunk["role"] = "assistant"
-        if (tool_calls := response_message.get("tool_calls")) is not None:
-            chunk["tool_calls"] = [
-                llm.ToolInput(
-                    tool_name=tool_call["function"]["name"],
-                    tool_args=_parse_tool_args(tool_call["function"]["arguments"]),
-                )
-                for tool_call in tool_calls
-            ]
-        if (content := response_message.get("content")) is not None:
-            chunk["content"] = content
-        if response_message.get("done"):
-            new_msg = True
-        yield chunk
+    skipping_think = False
+    discard_leading_newlines = False
+    while True:
+        async for response in result:
+            _LOGGER.debug("Received response: %s", response)
+            response_message = response["message"]
+            chunk: conversation.AssistantContentDeltaDict = {}
+            if new_msg:
+                new_msg = False
+                chunk["role"] = "assistant"
+            if (tool_calls := response_message.get("tool_calls")) is not None:
+                chunk["tool_calls"] = [
+                    llm.ToolInput(
+                        tool_name=tool_call["function"]["name"],
+                        tool_args=_parse_tool_args(tool_call["function"]["arguments"]),
+                    )
+                    for tool_call in tool_calls
+                ]
+            if (content := response_message.get("content")) is not None:
+                if not skipping_think and content.startswith("<think>"):
+                    skipping_think = True
+                if skipping_think:
+                    if "</think>" in content:
+                        skipping_think = False
+                        # Remove up to and including </think>
+                        content = content.split("</think>", 1)[1]
+                        # If think tags were removed, discard leading newlines from now on
+                        discard_leading_newlines = True
+                        if content:
+                            # Strip leading newlines if present
+                            content = content.lstrip("\n")
+                            if content:
+                                chunk["content"] = content
+                        # else: skip this chunk
+                    # else: skip this chunk
+                elif discard_leading_newlines:
+                    # Discard leading newlines until a non-newline token is received
+                    content = content.lstrip("\n")
+                    if content:
+                        chunk["content"] = content
+                        discard_leading_newlines = False
+                    # else: skip this chunk (still only newlines)
+                else:
+                    chunk["content"] = content
+            if response_message.get("done"):
+                new_msg = True
+            if (
+                chunk.get("content") is not None
+                or chunk.get("tool_calls") is not None
+                or chunk.get("role") is not None
+            ):
+                yield chunk
+        break
 
 
 class OllamaConversationEntity(
@@ -286,7 +339,8 @@ class OllamaConversationEntity(
         )
 
     def _trim_history(self, message_history: MessageHistory, max_messages: int) -> None:
-        """Trims excess messages from a single history.
+        """
+        Trims excess messages from a single history.
 
         This sets the max history to allow a configurable size history may take
         up in the context window.
