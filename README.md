@@ -11,3 +11,4 @@ It uses the same domain as the built-in integration, so it will replace it. All 
 1. Add this repository to HACS *AS A CUSTOM REPOSITORY*.
 2. Search for *Ollama*, and choose install.
 3. Reboot Home Assistant and configure from the "Add Integration" flow.
+   Note: Configuring not necessary if you previously setup the core ollama integration.
